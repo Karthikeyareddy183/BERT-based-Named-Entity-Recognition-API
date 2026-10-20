@@ -1,0 +1,9 @@
+[server]
+# Skip scanning transformers modules, which logs noisy torchvision import errors
+fileWatcherType = "none"
+
+[browser]
+gatherUsageStats = false
+
+[theme]
+primaryColor = "#2563eb"

@@ -1,79 +1,84 @@
-from flask import Flask, request, jsonify, render_template
-from transformers import pipeline
+"""Flask NER interface; deploy with a WSGI server."""
+import os
+from flask import Flask, jsonify, render_template, request
 from flask_httpauth import HTTPBasicAuth
-from werkzeug.security import generate_password_hash, check_password_hash
+from werkzeug.exceptions import BadRequest, RequestEntityTooLarge
+from werkzeug.security import check_password_hash
+from ner_service import NERService, ModelUnavailable, validate_text
 
-# Initialize Flask app
-app = Flask(__name__)
 
-# Initialize Basic Authentication
-auth = HTTPBasicAuth()
+def create_app(config=None, service=None):
+    app = Flask(__name__)
+    app.config.from_mapping(MAX_CONTENT_LENGTH=65536,
+        NER_USERNAME=os.environ.get('NER_USERNAME'),
+        NER_PASSWORD_HASH=os.environ.get('NER_PASSWORD_HASH'))
+    if config:
+        app.config.update(config)
+    if not app.config['NER_USERNAME'] or not app.config['NER_PASSWORD_HASH']:
+        raise RuntimeError('Set NER_USERNAME and NER_PASSWORD_HASH before starting the API')
+    service = service if service is not None else NERService()
+    auth = HTTPBasicAuth()
 
-# User credentials (username and password)
-users = {
-    "admin": generate_password_hash("password")  # Replace with your desired username and password
-}
+    @auth.verify_password
+    def verify_password(username, password):
+        if username == app.config['NER_USERNAME'] and check_password_hash(app.config['NER_PASSWORD_HASH'], password):
+            return username
+        return None
 
-# Verify user credentials
-@auth.verify_password
-def verify_password(username, password):
-    if username in users and check_password_hash(users.get(username), password):
-        return username
+    @auth.error_handler
+    def authentication_error(status):
+        return jsonify(error='Authentication required'), status
 
-# Load the fine-tuned NER model
-def load_model():
-    model_path = "./ner-bert-model"  # Path to your fine-tuned model
-    ner_pipeline = pipeline("ner", model=model_path, tokenizer=model_path, aggregation_strategy="simple")
-    return ner_pipeline
+    @app.errorhandler(RequestEntityTooLarge)
+    def too_large(error):
+        return jsonify(error='Request body too large'), 413
 
-# Load the model
-ner_pipeline = load_model()
+    def run_prediction(text):
+        try:
+            validate_text(text)
+            return service.predict(text), None
+        except ValueError as error:
+            return None, (jsonify(error=str(error)), 400)
+        except ModelUnavailable:
+            app.logger.exception('NER model unavailable')
+            return None, (jsonify(error='NER model is unavailable'), 503)
+        except Exception:
+            app.logger.exception('NER inference failed')
+            return None, (jsonify(error='NER inference failed'), 500)
 
-# Home route (renders home.html)
-@app.route("/", methods=["GET"])
-def home():
-    return render_template("home.html")
+    @app.get('/')
+    def home():
+        return render_template('home.html')
 
-# Predict route (renders predict.html and handles POST requests)
-@app.route("/predict", methods=["GET", "POST"])
-def predict():
-    if request.method == "POST":
-        # Get input text from the form
-        text = request.form.get("text")
+    @app.route('/predict', methods=['GET', 'POST'])
+    @auth.login_required
+    def predict():
+        if request.method == 'GET':
+            return render_template('predict.html', text='', entities=[])
+        text = request.form.get('text')
+        entities, error = run_prediction(text)
+        if error is not None:
+            return error
+        return render_template('predict.html', text=text, entities=entities)
 
-        if not text:
-            return jsonify({"error": "Missing 'text' field in form data"}), 400
+    @app.post('/api/predict')
+    @auth.login_required
+    def predict_api():
+        if not request.is_json:
+            return jsonify(error='Content-Type must be application/json'), 415
+        try:
+            data = request.get_json()
+        except BadRequest:
+            return jsonify(error='Malformed JSON'), 400
+        if not isinstance(data, dict) or 'text' not in data:
+            return jsonify(error="JSON input must be an object with a 'text' field"), 400
+        entities, error = run_prediction(data['text'])
+        if error is not None:
+            return error
+        return jsonify(text=data['text'], entities=entities)
 
-        # Run the NER pipeline
-        results = ner_pipeline(text)
+    return app
 
-        # Format the results for display
-        entities = [{"word": entity["word"], "entity": entity["entity_group"]} for entity in results]
 
-        return render_template("predict.html", text=text, entities=entities)
-
-    # Render the initial form for GET requests
-    return render_template("predict.html", text="", entities=[])
-
-# Predict API endpoint (accepts JSON input via Postman)
-@app.route("/api/predict", methods=["POST"])
-@auth.login_required
-def predict_api():
-    # Get input text from JSON
-    data = request.get_json()
-    if not data or "text" not in data:
-        return jsonify({"error": "Missing 'text' field in JSON input"}), 400
-
-    text = data["text"]
-
-    # Run the NER pipeline
-    results = ner_pipeline(text)
-
-    # Format the results
-    entities = [{"word": entity["word"], "entity": entity["entity_group"]} for entity in results]
-
-    return jsonify({"text": text, "entities": entities})
-
-# Run the app
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True)
+if __name__ == '__main__':
+    create_app().run(host='127.0.0.1', port=5000, debug=False)
